@@ -78,7 +78,7 @@ def listen_all(self, pkt):
             if pkt[TCP].flags & 0x04:
                 self.state = "RSTRECV"
             elif pkt[TCP].flags & 0x01:
-                self.state= "FINRECV"
+                self.state = "FINRECV"
             return
 
         if tcp_payload_size > MSS_SIZE:
@@ -129,10 +129,6 @@ class Sniffer(threading.Thread):
         self.state = "SUCCESS"
 
     def run(self):
-        '''
-        print "Start sniffing on port " + str(
-            self.port_num) + " :: " + self.url
-        '''
         sniff(
             iface='enp33s0',
             prn=partial(listen_all, self),
@@ -166,6 +162,10 @@ def three_way_handshake(ip_dst, sniffer, port_num):
     tls_raw = str(tls)
     ptr = 0
     current_ack = SYNACK.ack
+
+    if SYNACK.seq is None:
+        return "SYNACKERROR"
+
     while ptr < len(tls_raw):
         ACK = TCP(
             sport=port_num,
@@ -211,10 +211,12 @@ def do_icw(url):
     worker_id = int(current._identity[0])
 
     worker_id = worker_id % NUM_OPEN_PORTS
+    print "Start : " + url
     estimate = ICWEstimate(url, 55555 + worker_id)
     state, icw = estimate.run_icw_estimate()
     print "Estimiate : " + url + " :: " + str(icw) + "[" + state + "]"
     return (state, icw)
+
 
 def classify(url_to_icw):
     table_2_dict = {}
@@ -233,25 +235,25 @@ def classify(url_to_icw):
         if cnt >= 3:
             icw = next(iter(success_to_cnt))
             if success_to_cnt[icw] != cnt:
-                table_2_dict[url] = 2 # Category 2
+                table_2_dict[url] = 2  # Category 2
             else:
-                table_2_dict[url] = 1 # Category 1
+                table_2_dict[url] = 1  # Category 1
                 table_3_dict[url] = icw
         elif 1 <= cnt <= 2:
             icw = next(iter(success_to_cnt))
             if success_to_cnt[icw] != cnt:
-                table_2_dict[url] = 4 # Category 4
+                table_2_dict[url] = 4  # Category 4
             else:
-                table_2_dict[url] = 3 # Category 3
+                table_2_dict[url] = 3  # Category 3
         else:
-            table_2_dict[url] = 5 # Category 5
+            table_2_dict[url] = 5  # Category 5
 
     print table_3_dict
     print table_2_dict
 
     table_2 = [0, 0, 0, 0, 0]
     for url in table_2_dict:
-       table_2[table_2_dict[url] - 1] += 1
+        table_2[table_2_dict[url] - 1] += 1
 
     with open("table_2.csv", "wb") as csvfile:
         writer = csv.writer(csvfile, delimiter=",")
@@ -267,6 +269,7 @@ def classify(url_to_icw):
         writer = csv.writer(csvfile, delimiter=",")
         for url in url_to_icw:
             writer.writerow([url] + url_to_icw[url])
+
 
 if __name__ == "__main__":
     if args.url:
@@ -289,7 +292,7 @@ if __name__ == "__main__":
             continue
 
         url_list.append(url)
-        if len(url_list) >= 4550:
+        if len(url_list) >= 5000:
             break
 
     start = 0
@@ -300,6 +303,7 @@ if __name__ == "__main__":
         num_website_to_handle = args.numwebsite
 
     url_list = url_list[start:start + num_website_to_handle]
+    print url_list
     url_to_icw = {}
 
     for _ in range(5):
