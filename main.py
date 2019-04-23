@@ -9,6 +9,7 @@ from functools import partial
 import requests
 from multiprocessing import Pool
 import multiprocessing
+import csv
 
 load_layer("tls")
 
@@ -16,21 +17,19 @@ MY_IP = '128.12.16.127'
 MSS_SIZE = 64
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--ip", type=str)
-parser.add_argument("--url", type=str)
-parser.add_argument("--sniff", action="store_true")
 parser.add_argument("--numwebsite", type=int)
 parser.add_argument("--start", type=int)
+parser.add_argument("--numport", type=int)
+parser.add_argument("--url", type=str)
 
 args = parser.parse_args()
 
-if args.url:
-    TARGET_IP = socket.gethostbyname(args.url)
-else:
-    TARGET_IP = args.ip
+NUM_OPEN_PORTS = args.numport
+if not NUM_OPEN_PORTS:
+    NUM_OPEN_PORTS = 5
+
 
 def listen_all(self, pkt):
-    # print "---------------------------------------------------"
     if IP in pkt:
         ip_src = pkt[IP].src
         ip_dst = pkt[IP].dst
@@ -46,15 +45,8 @@ def listen_all(self, pkt):
     seq_no = pkt[TCP].seq
     ack_no = pkt[TCP].ack
 
-    '''
-    if ip_src == MY_IP or ip_dst == MY_IP:
-        print("%s:%s --> %s:%s" % (ip_src, tcp_sport, ip_dst, tcp_dport))
-        print("   seq : %d, ack : %d, size : %d" % (seq_no, ack_no, len(pkt)))
-    '''
-
     # Received another packet after last ACK to retrasmitted ACK.
     if self.do_reset:
-        # print "Sent RESET"
         ip = IP(ttl=255)
         ip.src = MY_IP
         ip.dst = ip_src
@@ -68,7 +60,6 @@ def listen_all(self, pkt):
             ack=max_seq_no)
         send(ip / RST, verbose=False)
 
-        # print self.received_seq_no
         self.iw = max(self.received_seq_no) - min(
             self.received_seq_no) + self.last_packet_len
         return
@@ -81,10 +72,17 @@ def listen_all(self, pkt):
         tcp_seg_len = ip_total_len - ip_header_len - tcp_header_len
 
         tcp_payload_size = tcp_seg_len
-        # print "Payload size : ", tcp_payload_size
 
         if tcp_payload_size == 0:
+            # If this is RST
+            if pkt[TCP].flags & 0x04:
+                self.state = "RSTRECV"
+            elif pkt[TCP].flags & 0x01:
+                self.state= "FINRECV"
             return
+
+        if tcp_payload_size > MSS_SIZE:
+            self.state = "MSSLARGE"
 
         if seq_no not in self.received_seq_no:
             self.received_seq_no.add(seq_no)
@@ -92,18 +90,15 @@ def listen_all(self, pkt):
             self.last_packet_len = tcp_payload_size
 
         else:
-            # print "Last ack no : ", self.last_ack_no, ack_no
             if self.last_ack_no != ack_no:
                 self.last_ack_no = ack_no
             else:
                 # Retransmitted ACK is received.
-                # print ">>>>>>>>>>> ACK to retrasmitted ACK sent <<<<<<<<<<<<"
                 ip = IP(ttl=255)
                 ip.src = MY_IP
                 ip.dst = ip_src
 
                 max_seq_no = max(self.received_seq_no) + 1
-                # print "Retrasmit ACK : ", max_seq_no, self.last_ack_no
                 ACK = TCP(
                     sport=self.port_num,
                     dport=443,
@@ -131,9 +126,13 @@ class Sniffer(threading.Thread):
         self.last_packet_len = 0
         self.do_reset = False
         self.iw = 0
+        self.state = "SUCCESS"
 
     def run(self):
-        print "Start sniffing on port " + str(self.port_num) + " :: " + self.url
+        '''
+        print "Start sniffing on port " + str(
+            self.port_num) + " :: " + self.url
+        '''
         sniff(
             iface='enp33s0',
             prn=partial(listen_all, self),
@@ -156,7 +155,7 @@ def three_way_handshake(ip_dst, sniffer, port_num):
 
     SYNACK = sr1(ip / tcp, verbose=False, timeout=2)
     if not SYNACK:
-        return
+        return "NOSYNACK"
 
     tls = TLSRecord() / TLSHandshakes(handshakes=[
         TLSHandshake() / TLSClientHello(
@@ -184,8 +183,11 @@ def three_way_handshake(ip_dst, sniffer, port_num):
 
     sniffer.client_hello_sent = True
 
+    return "SUCCESS"
+
+
 class ICWEstimate():
-    def __init__ (self, url, port_num):
+    def __init__(self, url, port_num):
         self.url = url
         self.port_num = port_num
 
@@ -193,28 +195,94 @@ class ICWEstimate():
         sniffing = Sniffer(self.port_num, self.url)
         sniffing.start()
 
-        website_ip = socket.gethostbyname(self.url)
-        three_way_handshake(website_ip, sniffing, self.port_num)
+        try:
+            website_ip = socket.gethostbyname(self.url)
+        except:
+            return ("URLNOEXIST", 0)
 
+        sniffing.state = three_way_handshake(website_ip, sniffing,
+                                             self.port_num)
         sniffing.join()
-        return sniffing.iw
+        return (sniffing.state, sniffing.iw)
+
 
 def do_icw(url):
     current = multiprocessing.current_process()
     worker_id = int(current._identity[0])
 
-    estimate = ICWEstimate(url, 55554 + worker_id)
-    icw = estimate.run_icw_estimate()
-    print "Estimiate : " + url + " :: " + str(icw)
-    return icw
+    worker_id = worker_id % NUM_OPEN_PORTS
+    estimate = ICWEstimate(url, 55555 + worker_id)
+    state, icw = estimate.run_icw_estimate()
+    print "Estimiate : " + url + " :: " + str(icw) + "[" + state + "]"
+    return (state, icw)
+
+def classify(url_to_icw):
+    table_2_dict = {}
+    table_3_dict = {}
+
+    for url in url_to_icw:
+        result = url_to_icw[url]
+
+        # First count the number of success
+        cnt = 0
+        success_to_cnt = {}
+        for state, icw in result:
+            if state == "SUCCESS":
+                success_to_cnt[icw] = success_to_cnt.get(icw, 0) + 1
+                cnt += 1
+        if cnt >= 3:
+            icw = next(iter(success_to_cnt))
+            if success_to_cnt[icw] != cnt:
+                table_2_dict[url] = 2 # Category 2
+            else:
+                table_2_dict[url] = 1 # Category 1
+                table_3_dict[url] = icw
+        elif 1 <= cnt <= 2:
+            icw = next(iter(success_to_cnt))
+            if success_to_cnt[icw] != cnt:
+                table_2_dict[url] = 4 # Category 4
+            else:
+                table_2_dict[url] = 3 # Category 3
+        else:
+            table_2_dict[url] = 5 # Category 5
+
+    print table_3_dict
+    print table_2_dict
+
+    table_2 = [0, 0, 0, 0, 0]
+    for url in table_2_dict:
+       table_2[table_2_dict[url] - 1] += 1
+
+    with open("table_2.csv", "wb") as csvfile:
+        writer = csv.writer(csvfile, delimiter=",")
+        for i in range(5):
+            writer.writerow([i, table_2[i]])
+
+    with open("table_3.csv", "wb") as csvfile:
+        writer = csv.writer(csvfile, delimiter=",")
+        for url in table_3_dict:
+            writer.writerow([url, table_3_dict[url]])
+
+    with open("table_4.csv", "wb") as csvfile:
+        writer = csv.writer(csvfile, delimiter=",")
+        for url in url_to_icw:
+            writer.writerow([url] + url_to_icw[url])
 
 if __name__ == "__main__":
+    if args.url:
+        p = Pool(NUM_OPEN_PORTS)
+        url_list = [args.url]
+        icw_result = p.map(do_icw, url_list)
+        print icw_result
+        exit()
+
     # Read the top 5000 websites.
     fp = open("top.txt")
     lines = fp.read().split("\r\n")
     fp.close()
 
     url_list = []
+    url = ""
     for line in lines:
         url = line[line.find('\t') + 1:]
         if url == "Hidden profile":
@@ -225,16 +293,24 @@ if __name__ == "__main__":
             break
 
     start = 0
+    num_website_to_handle = 1
     if args.start:
         start = args.start
+    if args.numwebsite:
+        num_website_to_handle = args.numwebsite
 
-    url_list = url_list[start:start+args.numwebsite]
-    print url_list
-    p = Pool(5)
-    icw_result = p.map(do_icw, url_list)
-
+    url_list = url_list[start:start + num_website_to_handle]
     url_to_icw = {}
-    for i in range(len(url_list)):
-        url_to_icw[url_list[i]] = icw_result[i]
+
+    for _ in range(5):
+        p = Pool(NUM_OPEN_PORTS)
+        icw_result = p.map(do_icw, url_list)
+
+        for i in range(len(url_list)):
+            if url_list[i] in url_to_icw:
+                url_to_icw[url_list[i]].append(icw_result[i])
+            else:
+                url_to_icw[url_list[i]] = [icw_result[i]]
 
     print url_to_icw
+    classify(url_to_icw)
