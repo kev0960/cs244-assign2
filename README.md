@@ -1,6 +1,6 @@
 # Measuring ICW
 
-## How To Startls
+## How To Start
 
 
 1. Run `sudo bash ./setup.sh (Number of Ports to use)`
